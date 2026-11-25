@@ -1,0 +1,540 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>С днём рождения, Оля!</title>
+<meta name="theme-color" content="#070910">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="manifest" href="manifest.json">
+<link rel="icon" type="image/png" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-192.png">
+<style>
+  html, body {
+    margin: 0; height: 100%;
+    background: #05060a;
+    overflow: hidden;
+    touch-action: manipulation;
+    -webkit-tap-highlight-color: transparent;
+  }
+  canvas {
+    position: fixed; left: 50%; top: 50%;
+    transform: translate(-50%, -50%);
+    display: block;
+  }
+</style>
+</head>
+<body>
+<canvas id="screen"></canvas>
+
+<script>
+(() => {
+'use strict';
+
+/* ================== НАСТРОЙКИ ================== */
+const TEXT1 = 'С днём рождения,';
+const TEXT2 = 'Оля!';
+
+// сколько секунд длится каждый этап
+const TL = {
+  reveal: 1.3,            // появление «текста» из темноты
+  zoom0: 10.5, zoom1: 18, // камера летит в зрачок
+  heart0: 17.6,           // из зрачка растёт сердце
+  stars0: 19,             // загораются звёзды
+  drift0: 20.8,           // сердце уходит вверх
+  drift1: 22.6,
+  text0: 22.4,            // появляется надпись
+  floaters0: 26           // всплывают маленькие сердечки
+};
+
+// символы от «пустых» к «плотным»
+const RAMP = " .,:;'-~!iIl/\\|(1{[?rxnuvczXYJCLQ0Zmwdbkao*#MW&8%B@$".split('');
+const RN = RAMP.length;
+const LV = 6;                 // уровней на канал при квантовании цвета
+const NCOL = LV * LV * LV;
+const SCRAMBLE = "@#%&WM8B$QO0XYZ/|{}[]<>".split('');
+const BG = '#070910';
+
+/* ================== УТИЛИТЫ ================== */
+const clamp01 = x => x < 0 ? 0 : x > 1 ? 1 : x;
+const smooth  = x => { x = clamp01(x); return x * x * (3 - 2 * x); };
+const lerp    = (a, b, k) => a + (b - a) * k;
+const easeOutBack = x => { x = clamp01(x); const c = 1.70158; return 1 + (c + 1) * Math.pow(x - 1, 3) + c * Math.pow(x - 1, 2); };
+
+function mulberry(seed) {
+  return function () {
+    seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+    let t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+const rnd = mulberry(20260);
+
+// форма сердца: полуширина = 1, центрирована
+const HEART = [];
+for (let i = 0; i < 90; i++) {
+  const a = i / 90 * Math.PI * 2;
+  const x = Math.pow(Math.sin(a), 3);
+  const y = -(13 * Math.cos(a) - 5 * Math.cos(2 * a) - 2 * Math.cos(3 * a) - Math.cos(4 * a)) / 16 - 0.156;
+  HEART.push([x, y]); // y вниз
+}
+function heartPath(c, cx, cy, s) {
+  c.beginPath();
+  for (let i = 0; i < HEART.length; i++) {
+    const px = cx + HEART[i][0] * s, py = cy + HEART[i][1] * s;
+    if (i) c.lineTo(px, py); else c.moveTo(px, py);
+  }
+  c.closePath();
+}
+
+/* ================== ХОЛСТЫ ================== */
+const cv = document.getElementById('screen');
+const ctx = cv.getContext('2d');
+const scene = document.createElement('canvas');          // низкое разрешение: 1 пиксель = 1 символ
+const sctx = scene.getContext('2d', { willReadFrequently: true });
+const atlas = document.createElement('canvas');          // кэш готовых символов
+const actx = atlas.getContext('2d');
+
+let DPR = 1, W = 0, H = 0, SHU = 160;
+let spw = 6, sph = 10, cols = 0, rows = 0;
+let SX = 1, SY = 1;
+let AC = 96, slotGen = null;
+let noise = null, revealHash = null;
+let textLetters = [];
+let hintFont = '';
+
+const LUT = new Uint8Array(256);
+for (let i = 0; i < 256; i++) LUT[i] = Math.min(RN - 1, Math.floor(Math.pow(i / 255, 0.85) * (RN - 1) + 0.5));
+
+function layout() {
+  DPR = Math.min(window.devicePixelRatio || 1, 3);
+  const vw = window.innerWidth, vh = window.innerHeight;
+  const sw = Math.min(vw, vh * 0.62);                    // «экран» всегда вертикальный, как в видео
+  spw = Math.min(16, Math.max(5, Math.round(4.6 * DPR)));
+  sph = Math.round(spw * 1.75);
+  cols = Math.floor(sw * DPR / spw);
+  rows = Math.floor(vh * DPR / sph);
+  W = cols * spw; H = rows * sph;
+  cv.width = W; cv.height = H;
+  cv.style.width = (W / DPR) + 'px';
+  cv.style.height = (H / DPR) + 'px';
+  SHU = 100 * H / W;
+  SX = cols / 100; SY = rows / SHU;
+  scene.width = cols; scene.height = rows;
+
+  const total = NCOL * RN;
+  atlas.width = AC * spw;
+  atlas.height = Math.ceil(total / AC) * sph;
+  slotGen = new Uint8Array(total);
+
+  noise = new Int8Array(cols * rows);
+  revealHash = new Float32Array(cols * rows);
+  for (let i = 0; i < noise.length; i++) {
+    noise[i] = ((rnd() * 7) | 0) - 3;
+    revealHash[i] = rnd();
+  }
+  buildText();
+}
+
+function makeSlot(slot, key, g) {
+  const step = 255 / (LV - 1);
+  const qb = key % LV, qg = Math.floor(key / LV) % LV, qr = Math.floor(key / (LV * LV));
+  const sx = (slot % AC) * spw, sy = Math.floor(slot / AC) * sph;
+  actx.fillStyle = 'rgb(' + Math.round(qr * step) + ',' + Math.round(qg * step) + ',' + Math.round(qb * step) + ')';
+  actx.font = 'bold ' + Math.round(sph * 0.84) + 'px ui-monospace, Menlo, Consolas, "DejaVu Sans Mono", monospace';
+  actx.textAlign = 'center';
+  actx.textBaseline = 'middle';
+  actx.fillText(RAMP[g], sx + spw / 2, sy + sph / 2 + sph * 0.04);
+  slotGen[slot] = 1;
+}
+
+/* ================== СЦЕНА (то, что превращается в символы) ================== */
+const OPEN = [[0,0],[1.2,0],[2.2,.55],[3.1,.95],[3.5,.95],[3.85,.03],[4.15,.03],[4.9,1],[7.2,1],[7.4,.08],[7.65,1],[9,1]];
+function openness(t) {
+  if (t <= OPEN[0][0]) return OPEN[0][1];
+  for (let i = 0; i < OPEN.length - 1; i++) {
+    const a = OPEN[i], b = OPEN[i + 1];
+    if (t < b[0]) return lerp(a[1], b[1], smooth((t - a[0]) / (b[0] - a[0])));
+  }
+  return OPEN[OPEN.length - 1][1];
+}
+
+// волокна радужки считаем один раз
+const FIBERS = [];
+{
+  const r = mulberry(7);
+  for (let i = 0; i < 140; i++) {
+    FIBERS.push({ a: i / 140 * Math.PI * 2 + r() * 0.04, k: 0.78 + r() * 0.2, light: r() > 0.45, w: 0.25 + r() * 0.5 });
+  }
+}
+
+function beatAt(tb) {
+  if (tb <= 0) return 0;
+  const p = tb % 1.05;
+  return Math.exp(-Math.pow((p - 0.10) / 0.07, 2)) + 0.65 * Math.exp(-Math.pow((p - 0.32) / 0.09, 2));
+}
+
+function drawScene(t) {
+  const c = sctx;
+  c.setTransform(1, 0, 0, 1, 0, 0);
+  c.fillStyle = '#000';
+  c.fillRect(0, 0, cols, rows);
+  c.setTransform(SX, 0, 0, SY, 0, 0);
+
+  const zp = clamp01((t - TL.zoom0) / (TL.zoom1 - TL.zoom0));
+  const ze = smooth(zp);
+  const cx = 50, ey = SHU * 0.5;
+  const a = 48, hUp = 28, hLow = 22;
+  const R = 25;
+  const r0 = 10.5 + 2.0 * ze + 0.5 * Math.sin(t * 1.7) * (1 - ze);
+  const o = openness(t);
+
+  const gz = (1 - smooth((t - 8.5) / 2.5)) * smooth((t - 2) / 2);
+  const lx = gz * (5 * Math.sin(t * 1.1) + 2 * Math.sin(t * 2.3));
+  const ly = gz * (1.6 * Math.sin(t * 0.8 + 1));
+  const ix = cx + lx, iy = ey + 1 + ly;
+
+  if (zp < 1) {
+    // камера
+    const Dmax = Math.hypot(50, SHU / 2);
+    const zEnd = Dmax / 12.5 * 1.12;
+    const z = Math.exp(Math.log(zEnd) * ze);
+    const camx = lerp(50, ix, ze), camy = lerp(SHU / 2, iy, ze);
+    c.translate(50, SHU / 2);
+    c.scale(z, z);
+    c.translate(-camx, -camy);
+
+    // кожа
+    const sk = c.createLinearGradient(0, ey - 70, 0, ey + 70);
+    sk.addColorStop(0, '#6e3010');
+    sk.addColorStop(0.5, '#d4792f');
+    sk.addColorStop(1, '#7c3814');
+    c.fillStyle = sk;
+    c.fillRect(-60, ey - SHU, 220, SHU * 2);
+
+    // складка века и нижняя линия
+    c.lineCap = 'round';
+    c.strokeStyle = 'rgba(60,20,5,0.85)';
+    c.lineWidth = 2.2;
+    c.beginPath(); c.moveTo(1, ey - 2); c.quadraticCurveTo(50, ey - 2 * (hUp * o + 14), 99, ey - 2); c.stroke();
+    c.strokeStyle = 'rgba(60,20,5,0.5)';
+    c.lineWidth = 1.5;
+    c.beginPath(); c.moveTo(6, ey + 2); c.quadraticCurveTo(50, ey + 2 * (hLow * o + 10), 94, ey + 2); c.stroke();
+
+    // форма глаза
+    const eyePath = () => {
+      c.beginPath();
+      c.moveTo(cx - a, ey);
+      c.quadraticCurveTo(cx, ey - 2 * hUp * o, cx + a, ey);
+      c.quadraticCurveTo(cx, ey + 2 * hLow * o, cx - a, ey);
+      c.closePath();
+    };
+
+    if (o > 0.04) {
+      c.save();
+      eyePath();
+      c.clip();
+
+      // белок
+      const sc = c.createLinearGradient(cx - a, 0, cx + a, 0);
+      sc.addColorStop(0, '#b3998a');
+      sc.addColorStop(0.2, '#efe5da');
+      sc.addColorStop(0.5, '#ffffff');
+      sc.addColorStop(0.8, '#efe5da');
+      sc.addColorStop(1, '#b3998a');
+      c.fillStyle = sc;
+      c.fillRect(0, ey - 50, 100, 100);
+
+      // радужка
+      const ig = c.createRadialGradient(ix, iy, r0, ix, iy, R);
+      ig.addColorStop(0, '#6b3004');
+      ig.addColorStop(0.15, '#d9820f');
+      ig.addColorStop(0.55, '#f4a92a');
+      ig.addColorStop(0.88, '#c66a10');
+      ig.addColorStop(1, '#3d1804');
+      c.fillStyle = ig;
+      c.beginPath(); c.arc(ix, iy, R, 0, Math.PI * 2); c.fill();
+
+      // волокна
+      for (let i = 0; i < FIBERS.length; i++) {
+        const f = FIBERS[i];
+        const ca = Math.cos(f.a), sa = Math.sin(f.a);
+        c.strokeStyle = f.light ? 'rgba(255,226,130,0.22)' : 'rgba(70,25,0,0.30)';
+        c.lineWidth = f.w;
+        c.beginPath();
+        c.moveTo(ix + ca * (r0 + 0.6), iy + sa * (r0 + 0.6));
+        c.lineTo(ix + ca * R * f.k, iy + sa * R * f.k);
+        c.stroke();
+      }
+      // тёмное кольцо по краю радужки
+      c.strokeStyle = 'rgba(30,10,0,0.65)';
+      c.lineWidth = 1.6;
+      c.beginPath(); c.arc(ix, iy, R - 0.8, 0, Math.PI * 2); c.stroke();
+
+      // зрачок
+      c.fillStyle = '#050304';
+      c.beginPath(); c.arc(ix, iy, r0, 0, Math.PI * 2); c.fill();
+
+      // блики
+      const hl = 1 - smooth((zp - 0.25) / 0.5);
+      if (hl > 0) {
+        c.fillStyle = 'rgba(255,255,255,' + (0.95 * hl) + ')';
+        c.beginPath(); c.arc(ix - r0 * 0.42, iy - r0 * 0.42, r0 * 0.26, 0, Math.PI * 2); c.fill();
+        c.fillStyle = 'rgba(255,255,255,' + (0.5 * hl) + ')';
+        c.beginPath(); c.arc(ix + r0 * 0.38, iy + r0 * 0.4, r0 * 0.11, 0, Math.PI * 2); c.fill();
+      }
+
+      // тень от верхнего века
+      const top = ey - hUp * o;
+      const sg = c.createLinearGradient(0, top, 0, top + 11);
+      sg.addColorStop(0, 'rgba(0,0,0,0.55)');
+      sg.addColorStop(1, 'rgba(0,0,0,0)');
+      c.fillStyle = sg;
+      c.fillRect(0, top - 1, 100, 13);
+      c.restore();
+    }
+
+    // ресничная линия
+    c.strokeStyle = '#220c04';
+    c.lineWidth = 2.8;
+    c.beginPath(); c.moveTo(cx - a, ey); c.quadraticCurveTo(cx, ey - 2 * hUp * o, cx + a, ey); c.stroke();
+    c.lineWidth = 1.4;
+    c.beginPath(); c.moveTo(cx - a, ey); c.quadraticCurveTo(cx, ey + 2 * hLow * o, cx + a, ey); c.stroke();
+  }
+
+  // ---- сердце (рисуется поверх, без камеры) ----
+  c.setTransform(SX, 0, 0, SY, 0, 0);
+  const hp = (t - TL.heart0);
+  if (hp > 0) {
+    const ha = smooth(hp / 1.2);
+    const grow = easeOutBack(hp / 2.6);
+    const beat = beatAt(t - (TL.heart0 + 2.6));
+    const s = 24 * grow * (1 + 0.07 * beat);
+    const hy = lerp(SHU * 0.5, SHU * 0.36, smooth((t - TL.drift0) / (TL.drift1 - TL.drift0)));
+    if (s > 0.1) {
+      const hg = c.createRadialGradient(50, hy, 0, 50, hy, s * 1.75);
+      hg.addColorStop(0, 'rgba(255,40,100,' + (0.22 * ha) + ')');
+      hg.addColorStop(1, 'rgba(255,40,100,0)');
+      c.fillStyle = hg;
+      c.fillRect(0, 0, 100, SHU);
+
+      const g2 = c.createRadialGradient(50, hy - s * 0.2, 0, 50, hy, s * 1.1);
+      g2.addColorStop(0, '#fff2f6');
+      g2.addColorStop(0.3, '#ff8fb0');
+      g2.addColorStop(0.7, '#f5305f');
+      g2.addColorStop(1, '#d81f4c');
+      c.globalAlpha = ha;
+      c.fillStyle = g2;
+      heartPath(c, 50, hy, s);
+      c.fill();
+      c.globalAlpha = 1;
+    }
+  }
+}
+
+/* ================== ЗВЁЗДЫ ================== */
+const STARS = [];
+{
+  const r = mulberry(99);
+  for (let i = 0; i < 70; i++) {
+    STARS.push({
+      x: r(), y: r(),
+      big: r() > 0.78,
+      size: 0.8 + r() * 1.2,
+      len: 5 + r() * 9,
+      sp: 0.8 + r() * 2.2,
+      ph: r() * 6.28,
+      t0: TL.stars0 + r() * 3.5
+    });
+  }
+}
+function drawStars(t) {
+  if (t < TL.stars0) return;
+  const c = ctx;
+  for (let i = 0; i < STARS.length; i++) {
+    const s = STARS[i];
+    const vis = smooth((t - s.t0) / 0.8);
+    if (vis <= 0) continue;
+    const tw = 0.4 + 0.6 * (0.5 + 0.5 * Math.sin(t * s.sp + s.ph));
+    const al = vis * tw;
+    const x = s.x * W, y = s.y * H;
+    c.fillStyle = 'rgba(255,255,255,' + al + ')';
+    c.beginPath(); c.arc(x, y, s.size * DPR, 0, 6.2832); c.fill();
+    if (s.big) {
+      const L = s.len * DPR * (0.7 + 0.5 * tw);
+      c.strokeStyle = 'rgba(255,255,255,' + (al * 0.9) + ')';
+      c.lineWidth = Math.max(1, DPR * 0.9);
+      c.beginPath();
+      c.moveTo(x - L, y); c.lineTo(x + L, y);
+      c.moveTo(x, y - L); c.lineTo(x, y + L);
+      c.stroke();
+    }
+  }
+}
+
+/* ================== НАДПИСЬ ================== */
+function buildText() {
+  textLetters = [];
+  const fam = 'Roboto, "Segoe UI", "Helvetica Neue", Arial, sans-serif';
+  const probe = document.createElement('canvas').getContext('2d');
+
+  let fs1 = W * 0.095;
+  probe.font = '700 ' + fs1 + 'px ' + fam;
+  const w1 = probe.measureText(TEXT1).width;
+  if (w1 > W * 0.88) fs1 *= W * 0.88 / w1;
+
+  let fs2 = fs1 * 1.9;
+  probe.font = '800 ' + fs2 + 'px ' + fam;
+  const w2 = probe.measureText(TEXT2).width;
+  if (w2 > W * 0.8) fs2 *= W * 0.8 / w2;
+
+  const y1 = H * 0.655;
+  const y2 = y1 + fs2 * 1.08;
+
+  function addLine(text, fs, weight, y, t0, step) {
+    probe.font = weight + ' ' + fs + 'px ' + fam;
+    const total = probe.measureText(text).width;
+    const x0 = (W - total) / 2;
+    for (let i = 0; i < text.length; i++) {
+      const before = probe.measureText(text.slice(0, i)).width;
+      const wch = probe.measureText(text[i]).width;
+      if (text[i] === ' ') continue;
+      textLetters.push({ ch: text[i], x: x0 + before + wch / 2, y: y, font: weight + ' ' + fs + 'px ' + fam, start: t0 + i * step, name: weight === '800' });
+    }
+    return t0 + text.length * step;
+  }
+  const end1 = addLine(TEXT1, fs1, '700', y1, TL.text0, 0.07);
+  addLine(TEXT2, fs2, '800', y2, end1 + 0.15, 0.14);
+  hintFont = '400 ' + Math.round(W * 0.032) + 'px ' + fam;
+}
+
+function drawText(t, beat) {
+  if (t < TL.text0) return;
+  const c = ctx;
+  c.textAlign = 'center';
+  c.textBaseline = 'alphabetic';
+  for (let i = 0; i < textLetters.length; i++) {
+    const L = textLetters[i];
+    const tt = t - L.start;
+    if (tt < 0) continue;
+    c.font = L.font;
+    if (tt < 0.35) {
+      const ch = SCRAMBLE[(Math.floor(t * 20) + i * 7) % SCRAMBLE.length];
+      c.shadowColor = 'rgba(255,60,120,0.6)';
+      c.shadowBlur = 8 * DPR;
+      c.fillStyle = 'rgba(255,120,165,0.9)';
+      c.fillText(ch, L.x, L.y);
+    } else {
+      c.shadowColor = 'rgba(255,50,110,0.95)';
+      c.shadowBlur = (L.name ? 26 + 12 * beat : 16 + 8 * beat) * DPR;
+      c.fillStyle = L.name ? '#fff2f7' : '#ffe6ee';
+      c.fillText(L.ch, L.x, L.y);
+    }
+  }
+  c.shadowBlur = 0;
+  c.shadowColor = 'transparent';
+
+  const done = t - (TL.floaters0 + 2.5);
+  if (done > 0) {
+    c.font = hintFont;
+    c.fillStyle = 'rgba(255,255,255,' + (0.32 * smooth(done / 1.5)) + ')';
+    c.fillText('коснись экрана — повторить', W / 2, H - 22 * DPR);
+  }
+}
+
+/* ================== ПЛАВАЮЩИЕ СЕРДЕЧКИ ================== */
+const FLOAT = [];
+{
+  const r = mulberry(5);
+  for (let i = 0; i < 16; i++) {
+    FLOAT.push({ x: r(), sp: 0.035 + r() * 0.05, ph: r() * 10, size: 0.9 + r() * 1.8, a: 0.22 + r() * 0.4, off: r() * 1.2 });
+  }
+}
+function drawFloaters(t) {
+  const f = smooth((t - TL.floaters0) / 2);
+  if (f <= 0) return;
+  const c = ctx;
+  for (let i = 0; i < FLOAT.length; i++) {
+    const h = FLOAT[i];
+    const y = 1.1 - ((t * h.sp + h.off) % 1.2);
+    const x = (h.x + Math.sin(t * 0.7 + h.ph) * 0.04) * W;
+    c.fillStyle = 'rgba(255,' + (80 + (i * 13) % 70) + ',150,' + (h.a * f) + ')';
+    heartPath(c, x, y * H, h.size * W / 100);
+    c.fill();
+  }
+}
+
+/* ================== ОТРИСОВКА КАДРА ================== */
+function render(t) {
+  drawScene(t);
+  const img = sctx.getImageData(0, 0, cols, rows).data;
+
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.imageSmoothingEnabled = false;
+  ctx.fillStyle = BG;
+  ctx.fillRect(0, 0, W, H);
+
+  const rv = clamp01(t / TL.reveal);
+  const n = cols * rows;
+
+  // живое «мерцание» символов
+  const flick = (n * 0.025) | 0;
+  for (let k = 0; k < flick; k++) noise[(Math.random() * n) | 0] = ((Math.random() * 7) | 0) - 3;
+
+  const GAIN = 1.35, Q = (LV - 1) / 255;
+  for (let r = 0; r < rows; r++) {
+    const dy = r * sph;
+    for (let c = 0; c < cols; c++) {
+      const idx = r * cols + c;
+      if (revealHash[idx] > rv) continue;
+      const p = idx * 4;
+      const R = img[p], G = img[p + 1], B = img[p + 2];
+      const lum = (R * 77 + G * 151 + B * 28) >> 8;
+      if (lum < 12) continue;
+      let gi = LUT[lum] + noise[idx];
+      if (gi < 1) gi = 1; else if (gi > RN - 1) gi = RN - 1;
+      const qr = ((R * GAIN > 255 ? 255 : R * GAIN) * Q + 0.5) | 0;
+      const qg = ((G * GAIN > 255 ? 255 : G * GAIN) * Q + 0.5) | 0;
+      const qb = ((B * GAIN > 255 ? 255 : B * GAIN) * Q + 0.5) | 0;
+      const key = (qr * LV + qg) * LV + qb;
+      const slot = key * RN + gi;
+      if (!slotGen[slot]) makeSlot(slot, key, gi);
+      ctx.drawImage(atlas, (slot % AC) * spw, ((slot / AC) | 0) * sph, spw, sph, c * spw, dy, spw, sph);
+    }
+  }
+
+  drawStars(t);
+  drawFloaters(t);
+  drawText(t, beatAt(t - (TL.heart0 + 2.6)));
+}
+
+/* ================== ЗАПУСК ================== */
+const params = new URLSearchParams(location.search);
+const skip = parseFloat(params.get('t')) || 0;   // ?t=20 — перемотать (для проверки)
+let tStart = performance.now() - skip * 1000;
+let last = 0;
+
+function frame(now) {
+  requestAnimationFrame(frame);
+  if (now - last < 30) return;      // ~30 кадров в секунду — хватает и экономит батарею
+  last = now;
+  render((now - tStart) / 1000);
+}
+
+window.addEventListener('resize', layout);
+window.addEventListener('pointerdown', () => { tStart = performance.now(); });
+
+layout();
+requestAnimationFrame(frame);
+
+// Офлайн-режим и установка как приложение (работает только по https или localhost)
+if ('serviceWorker' in navigator && /^https?:$/.test(location.protocol)) {
+  window.addEventListener('load', () => navigator.serviceWorker.register('sw.js').catch(() => {}));
+}
+})();
+</script>
+</body>
+</html>
